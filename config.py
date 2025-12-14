@@ -56,4 +56,10 @@ class TrainConfig:
     dir_ascent_lr: float = 0.5
     sigreg_start_epoch: int = 2
     sigreg_ramp_epochs: int = 0
+    sigreg_hard_start_step: int = 1200
+    sigreg_hard_ramp_steps: int = 2000
+    sigreg_hard_max_frac: float = 0.25
+    dir_ascent_steps: int = 3
+    dir_ascent_lr: float = 3e-3
+
 
