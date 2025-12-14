@@ -1,17 +1,18 @@
 from dataclasses import dataclass
 
-
 @dataclass(frozen=True)
 class TrainConfig:
     seed: int = 42
     device: str = "cuda"
-    batch_size: int = 32
-    num_workers: int = 2
+    batch_size: int = 64
+    num_workers: int = 0
+    train_fraction: float = 0.3
+    test_fraction: float = 0.1
     epochs: int = 20
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     grad_clip: float = 5.0
-    emb_dim: int = 128
+    emb_dim: int = 256
     ctx_area_min: float = 0.55
     ctx_area_max: float = 1.00
     tgt_area_min: float = 0.15
@@ -20,31 +21,39 @@ class TrainConfig:
     out_size: int = 28
     ema_m: float = 0.996
     method: str = "ijepa"
-    sigreg_lambda: float = 0.25
-    sigreg_num_slices: int = 32
+    sigreg_lambda: float = 1e-9
+    sigreg_num_slices: int = 1024
     sigreg_t_min: float = -5.0
     sigreg_t_max: float = 5.0
     sigreg_t_steps: int = 17
     hard_pool_size: int = 512
-    hard_num_slices: int = 8
+    hard_num_slices: int = 64
     random_extra_slices: int = 0
     logdir: str = "runs/jepa"
     log_every: int = 50
     eval_every_epochs: int = 1
-    eval_max_samples: int = 10000
+    eval_max_samples: int = 1000
     kmeans_iters: int = 30
     kmeans_restarts: int = 3
-    silhouette_samples: int = 2000
+    silhouette_samples: int = 1000
     knn_k: int = 20
     knn_temperature: float = 0.07
-    knn_max_train: int = 20000
-    knn_max_test: int = 5000
-    knn_chunk_size: int = 2048
-    report_every_epochs: int = 5
+    knn_max_train: int = 10000
+    knn_max_test: int = 2000
+    knn_chunk_size: int = 1024
+    report_every_epochs: int = 1
     report_max_points: int = 3000
-    retrieval_every_epochs: int = 5
-    retrieval_bank_max: int = 8000
+    retrieval_every_epochs: int = 1
+    retrieval_bank_max: int = 2000
     retrieval_query_num: int = 10
     retrieval_topk: int = 5
-    num_views: int = 6
+    num_views: int = 8
     ckpt_path: str = "checkpoints/jepa_mnist.pt"
+    tsne_perplexity: float = 30.0
+    tsne_iters: int = 400
+    tsne_lr: str = "auto"
+    dir_ascent_steps: int = 5
+    dir_ascent_lr: float = 0.5
+    sigreg_start_epoch: int = 2
+    sigreg_ramp_epochs: int = 0
+

@@ -14,7 +14,7 @@ from losses.sigreg import SIGReg
 from utils.seed import set_seed
 from utils.ema import ema_update
 from utils.logger import Logger
-from utils.plots import save_pca_scatter, save_confusion_matrix
+from utils.plots import save_pca_scatter, save_tsne_scatter, save_confusion_matrix
 from utils.retrieval import save_retrieval_collage
 from metrics.repr_stats import grad_global_norm, cov_metrics, spectrum_metrics, pairwise_cos_stats, alignment_uniformity
 from evaluate import extract_embeddings, eval_clustering, eval_knn
@@ -38,7 +38,7 @@ def train_one_run(cfg: TrainConfig) -> None:
     report_dir = Path(cfg.logdir) / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     collate = MNISTJEPACollate(cfg.out_size, cfg.num_targets, (cfg.ctx_area_min, cfg.ctx_area_max), (cfg.tgt_area_min, cfg.tgt_area_max))
-    train_ssl_loader, train_plain_loader, test_plain_loader = make_mnist_ssl_and_plain_loaders(cfg.batch_size, cfg.num_workers, collate)
+    train_ssl_loader, train_plain_loader, test_plain_loader = make_mnist_ssl_and_plain_loaders(cfg.batch_size, cfg.num_workers, collate, train_fraction=cfg.train_fraction, test_fraction=cfg.test_fraction, seed=cfg.seed)
     student, teacher, predictor, sigreg = build_models(cfg)
     student.to(device); teacher.to(device); predictor.to(device)
     if sigreg is not None:
@@ -56,8 +56,12 @@ def train_one_run(cfg: TrainConfig) -> None:
             z_ctx_s = student(ctx)
             with torch.no_grad():
                 z_tgts_t = [teacher(ti) for ti in tgt_imgs]
-            preds = [predictor(z_ctx_s, tgt_pos[i]) for i in range(cfg.num_targets)]
-            loss_pred = jepa_pred_loss(preds, z_tgts_t)
+                preds = [predictor(z_ctx_s, tgt_pos[i]) for i in range(cfg.num_targets)]
+
+                preds_n = [F.normalize(p, dim=-1) for p in preds]
+                z_tgts_t_n = [F.normalize(z, dim=-1) for z in z_tgts_t]
+
+                loss_pred = jepa_pred_loss(preds_n, z_tgts_t_n)
             loss_sig = torch.tensor(0.0, device=device)
             if cfg.method.lower() == "lejepa":
                 loss_sig = sigreg(z_ctx_s, seed=global_step)
@@ -126,8 +130,40 @@ def train_one_run(cfg: TrainConfig) -> None:
                 metrics[f"eval_teacher/{k}"] = v
             logger.log(global_step, metrics)
             if epoch % cfg.report_every_epochs == 0:
-                save_pca_scatter(z_student_test, y_test, path=str(report_dir / f"epoch{epoch:03d}_student_pca.png"), title=f"{cfg.method} | epoch {epoch} | student PCA (test)", max_points=cfg.report_max_points)
-                save_pca_scatter(z_teacher_test, y_test, path=str(report_dir / f"epoch{epoch:03d}_teacher_pca.png"), title=f"{cfg.method} | epoch {epoch} | teacher PCA (test)", max_points=cfg.report_max_points)
+                save_pca_scatter(
+                    z_student_test, y_test,
+                    path=str(report_dir / f"epoch{epoch:03d}_student_pca.png"),
+                    title=f"{cfg.method} | epoch {epoch} | student PCA (test)",
+                    max_points=cfg.report_max_points,
+                )
+                save_tsne_scatter(
+                    z_student_test, y_test,
+                    path=str(report_dir / f"epoch{epoch:03d}_student_tsne.png"),
+                    title=f"{cfg.method} | epoch {epoch} | student t-SNE (test)",
+                    max_points=min(cfg.report_max_points, 2000),
+                    perplexity=cfg.tsne_perplexity,
+                    iters=cfg.tsne_iters,
+                    seed=cfg.seed + epoch,
+                    learning_rate=cfg.tsne_lr,
+                )
+
+                save_pca_scatter(
+                    z_teacher_test, y_test,
+                    path=str(report_dir / f"epoch{epoch:03d}_teacher_pca.png"),
+                    title=f"{cfg.method} | epoch {epoch} | teacher PCA (test)",
+                    max_points=cfg.report_max_points,
+                )
+                save_tsne_scatter(
+                    z_teacher_test, y_test,
+                    path=str(report_dir / f"epoch{epoch:03d}_teacher_tsne.png"),
+                    title=f"{cfg.method} | epoch {epoch} | teacher t-SNE (test)",
+                    max_points=min(cfg.report_max_points, 2000),
+                    perplexity=cfg.tsne_perplexity,
+                    iters=cfg.tsne_iters,
+                    seed=cfg.seed + 999 + epoch,
+                    learning_rate=cfg.tsne_lr,
+                )
+
                 save_confusion_matrix(knn_cm_s, path=str(report_dir / f"epoch{epoch:03d}_student_knn_cm.png"), title=f"{cfg.method} | epoch {epoch} | student kNN confusion", normalize=True)
                 save_confusion_matrix(knn_cm_t, path=str(report_dir / f"epoch{epoch:03d}_teacher_knn_cm.png"), title=f"{cfg.method} | epoch {epoch} | teacher kNN confusion", normalize=True)
                 if epoch % cfg.retrieval_every_epochs == 0:

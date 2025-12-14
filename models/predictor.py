@@ -20,4 +20,5 @@ class JEPAPredictor(nn.Module):
         p = self.pos_mlp(pos)
         x = torch.cat([z_ctx, p], dim=-1)
         z = self.net(x)
-        return F.normalize(z, dim=-1)
+        z = torch.nn.functional.layer_norm(z, (z.size(-1),))
+        return z

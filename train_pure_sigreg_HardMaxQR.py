@@ -23,7 +23,7 @@ def train(cfg: TrainConfig) -> None:
     report_dir = Path(cfg.logdir) / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     collate = MNISTMultiViewCollate(cfg.out_size, (cfg.ctx_area_min, cfg.ctx_area_max), num_views=cfg.num_views)
-    train_ssl_loader, train_plain_loader, test_plain_loader = make_mnist_ssl_and_plain_loaders(cfg.batch_size, cfg.num_workers, collate)
+    train_ssl_loader, train_plain_loader, test_plain_loader = make_mnist_ssl_and_plain_loaders(cfg.batch_size, cfg.num_workers, collate, train_fraction=cfg.train_fraction, test_fraction=cfg.test_fraction, seed=cfg.seed)
     encoder = ResNetMNISTEncoder(cfg.emb_dim).to(device)
     sigreg = SIGRegHard(
         emb_dim=cfg.emb_dim,

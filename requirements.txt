@@ -2,3 +2,5 @@ torch
 tqdm
 tensorboard
 matplotlib
+scikit-learn
+

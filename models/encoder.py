@@ -71,4 +71,5 @@ class ResNetMNISTEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.backbone(x)
         z = self.proj(h)
-        return F.normalize(z, dim=-1)
+        z = torch.nn.functional.layer_norm(z, (z.size(-1),))
+        return z

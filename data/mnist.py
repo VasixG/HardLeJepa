@@ -10,7 +10,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 Box = Tuple[int, int, int, int]
 
@@ -21,6 +21,7 @@ _URLS = {
     "test_labels": "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz",
 }
 
+
 def _download(url: str, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -29,6 +30,7 @@ def _download(url: str, path: Path):
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
         f.write(r.read())
     tmp.replace(path)
+
 
 def _read_idx_images(gz_path: Path) -> torch.Tensor:
     with gzip.open(gz_path, "rb") as f:
@@ -39,6 +41,7 @@ def _read_idx_images(gz_path: Path) -> torch.Tensor:
     x = torch.frombuffer(data, dtype=torch.uint8).reshape(n, rows, cols)
     return x
 
+
 def _read_idx_labels(gz_path: Path) -> torch.Tensor:
     with gzip.open(gz_path, "rb") as f:
         magic, n = struct.unpack(">II", f.read(8))
@@ -47,6 +50,7 @@ def _read_idx_labels(gz_path: Path) -> torch.Tensor:
         data = f.read(n)
     y = torch.frombuffer(data, dtype=torch.uint8)
     return y
+
 
 class MNISTRaw(Dataset):
     def __init__(self, root: str, train: bool = True):
@@ -74,6 +78,7 @@ class MNISTRaw(Dataset):
     def __getitem__(self, idx: int):
         return self.x[idx], self.y[idx]
 
+
 def sample_box(H: int, W: int, area_range: Tuple[float, float], ratio_range: Tuple[float, float] = (0.75, 1.33)) -> Box:
     area = H * W
     for _ in range(10):
@@ -91,17 +96,20 @@ def sample_box(H: int, W: int, area_range: Tuple[float, float], ratio_range: Tup
     left = (W - size) // 2
     return top, left, size, size
 
+
 def box_to_pos(box: Box, H: int, W: int) -> torch.Tensor:
     top, left, h, w = box
     cx = (left + 0.5 * w) / W
     cy = (top + 0.5 * h) / H
     return torch.tensor([cx, cy, w / W, h / H], dtype=torch.float32)
 
+
 def resized_crop(x: torch.Tensor, top: int, left: int, h: int, w: int, out_size: int) -> torch.Tensor:
     patch = x[..., top:top + h, left:left + w]
     if patch.size(-1) != out_size or patch.size(-2) != out_size:
         patch = F.interpolate(patch.unsqueeze(0), size=(out_size, out_size), mode="bilinear", align_corners=False).squeeze(0)
     return patch
+
 
 def _gaussian_blur(x: torch.Tensor, k: int = 3, sigma: float = 1.0) -> torch.Tensor:
     if k <= 1:
@@ -113,6 +121,7 @@ def _gaussian_blur(x: torch.Tensor, k: int = 3, sigma: float = 1.0) -> torch.Ten
     kernel2d = (kernel[:, None] * kernel[None, :]).view(1, 1, k, k)
     pad = k // 2
     return F.conv2d(x, kernel2d, padding=pad)
+
 
 def _random_erasing(x: torch.Tensor, p: float = 0.15) -> torch.Tensor:
     if random.random() > p:
@@ -130,6 +139,7 @@ def _random_erasing(x: torch.Tensor, p: float = 0.15) -> torch.Tensor:
     x[:, top:top + h, left:left + w] = 0.0
     return x
 
+
 def _random_affine(x: torch.Tensor) -> torch.Tensor:
     angle = math.radians(random.uniform(-18, 18))
     scale = random.uniform(0.85, 1.15)
@@ -138,27 +148,24 @@ def _random_affine(x: torch.Tensor) -> torch.Tensor:
     ty = random.uniform(-0.12, 0.12)
     ca, sa = math.cos(angle), math.sin(angle)
     cs, ss = math.cos(shear), math.sin(shear)
-    A = torch.tensor([
-        [scale * ca, -scale * sa + ss, tx],
-        [scale * sa,  scale * ca + cs, ty],
-    ], dtype=torch.float32, device=x.device)
+    A = torch.tensor(
+        [
+            [scale * ca, -scale * sa + ss, tx],
+            [scale * sa, scale * ca + cs, ty],
+        ],
+        dtype=torch.float32,
+        device=x.device,
+    )
     grid = F.affine_grid(A.unsqueeze(0), size=(1, 1, x.size(-2), x.size(-1)), align_corners=False)
     y = F.grid_sample(x.unsqueeze(0), grid, mode="bilinear", padding_mode="zeros", align_corners=False).squeeze(0)
     return y
 
+
 def _jitter(x: torch.Tensor) -> torch.Tensor:
-    c = random.uniform(0.8, 1.2)
-    b = random.uniform(-0.12, 0.12)
-    y = (x * c + b).clamp(0.0, 1.0)
-    if random.random() < 0.15:
-        y = 1.0 - y
-    if random.random() < 0.15:
-        blur = _gaussian_blur(y.unsqueeze(0), k=3, sigma=1.0).squeeze(0)
-        y = (y + 0.75 * (y - blur)).clamp(0.0, 1.0)
-    if random.random() < 0.25:
-        y = _gaussian_blur(y.unsqueeze(0), k=3, sigma=1.0).squeeze(0)
-    y = _random_erasing(y, p=0.15)
-    return y
+    c = random.uniform(0.90, 1.10)
+    b = random.uniform(-0.10, 0.10)
+    return (x * c + b).clamp(0.0, 1.0)
+
 
 def strong_aug(x: torch.Tensor) -> torch.Tensor:
     if random.random() < 0.95:
@@ -166,11 +173,13 @@ def strong_aug(x: torch.Tensor) -> torch.Tensor:
     x = _jitter(x)
     return x
 
+
 @dataclass(frozen=True)
 class JEPAViews:
     ctx: torch.Tensor
     tgt_imgs: List[torch.Tensor]
     tgt_pos: List[torch.Tensor]
+
 
 class MNISTJEPACollate:
     def __init__(self, out_size: int, num_targets: int, ctx_area: Tuple[float, float], tgt_area: Tuple[float, float]):
@@ -203,9 +212,11 @@ class MNISTJEPACollate:
         tgt_pos = [torch.stack(v, dim=0) for v in tgt_pos]
         return (JEPAViews(ctx=ctx, tgt_imgs=tgt_imgs, tgt_pos=tgt_pos), y)
 
+
 @dataclass(frozen=True)
 class MultiViews:
     views: List[torch.Tensor]
+
 
 class MNISTMultiViewCollate:
     def __init__(self, out_size: int, area: Tuple[float, float], num_views: int):
@@ -229,16 +240,42 @@ class MNISTMultiViewCollate:
         views = [torch.stack(vs, dim=0) for vs in all_views]
         return (MultiViews(views=views), y)
 
-def make_plain_mnist_loaders(batch_size: int, num_workers: int):
+
+def make_plain_mnist_loaders(batch_size: int, num_workers: int, train_fraction: float = 1.0, test_fraction: float = 1.0, seed: int = 0):
     train_ds = MNISTRaw("./data/mnist", train=True)
     test_ds = MNISTRaw("./data/mnist", train=False)
+    if train_fraction < 1.0:
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        n = max(1, int(len(train_ds) * float(train_fraction)))
+        idx = torch.randperm(len(train_ds), generator=g)[:n].tolist()
+        train_ds = Subset(train_ds, idx)
+    if test_fraction < 1.0:
+        g = torch.Generator()
+        g.manual_seed(int(seed) + 1)
+        n = max(1, int(len(test_ds) * float(test_fraction)))
+        idx = torch.randperm(len(test_ds), generator=g)[:n].tolist()
+        test_ds = Subset(test_ds, idx)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, drop_last=False)
     return train_loader, test_loader
 
-def make_mnist_ssl_and_plain_loaders(batch_size: int, num_workers: int, ssl_collate):
+
+def make_mnist_ssl_and_plain_loaders(batch_size: int, num_workers: int, ssl_collate, train_fraction: float = 1.0, test_fraction: float = 1.0, seed: int = 0):
     train_ds = MNISTRaw("./data/mnist", train=True)
     test_ds = MNISTRaw("./data/mnist", train=False)
+    if train_fraction < 1.0:
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        n = max(1, int(len(train_ds) * float(train_fraction)))
+        idx = torch.randperm(len(train_ds), generator=g)[:n].tolist()
+        train_ds = Subset(train_ds, idx)
+    if test_fraction < 1.0:
+        g = torch.Generator()
+        g.manual_seed(int(seed) + 1)
+        n = max(1, int(len(test_ds) * float(test_fraction)))
+        idx = torch.randperm(len(test_ds), generator=g)[:n].tolist()
+        test_ds = Subset(test_ds, idx)
     train_ssl_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=True, collate_fn=ssl_collate)
     train_plain_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=False)
     test_plain_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, drop_last=False)
