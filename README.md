@@ -19,7 +19,7 @@ PyTorch implementation + MNIST experiments for **HardLeJEPA**: learning *adversa
     <td><img src="images/ijepa_retrieval.jpg" width="100%"></td>
     <td><img src="images/ijepareg_retireval.jpg" width="100%"></td>
     <td><img src="images/jepa_retrieval.jpg" width="100%"></td>
-    <td><img src="images/hardjepa_retrieval.jpg" width="90%"></td>
+    <td><img src="images/hardjepa_retrieval.jpg" width="100%"></td>
   </tr>
 </table>
 
