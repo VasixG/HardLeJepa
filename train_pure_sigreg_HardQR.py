@@ -100,7 +100,9 @@ def train(
     report_dir = Path(cfg.logdir) / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    collate = MNISTMultiViewCollate(cfg.out_size, (cfg.ctx_area_min, cfg.ctx_area_max), num_views=cfg.num_views)
+    collate = MNISTMultiViewCollate(
+        cfg.out_size, (cfg.ctx_area_min, cfg.ctx_area_max), num_views=cfg.num_views
+    )
     train_ssl_loader, train_plain_loader, test_plain_loader = make_mnist_ssl_and_plain_loaders(
         cfg.batch_size,
         cfg.num_workers,
@@ -125,7 +127,9 @@ def train(
         dir_ortho_init=True,
     ).to(device)
 
-    opt_enc = torch.optim.AdamW(list(encoder.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    opt_enc = torch.optim.AdamW(
+        list(encoder.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
     opt_dir = torch.optim.AdamW(list(sigreg.parameters()), lr=float(dir_lr), weight_decay=0.0)
 
     logger = Logger(cfg.logdir, str(Path(cfg.logdir) / "metrics.csv"), use_tb=True)
@@ -136,13 +140,14 @@ def train(
         sigreg.train()
 
         pbar = tqdm(train_ssl_loader, desc=f"epoch {epoch}/{cfg.epochs}")
-        for (views, _y) in pbar:
+        for views, _y in pbar:
             views_list = [v.to(device, non_blocking=True) for v in views.views]
             zs = [encoder(v) for v in views_list]
 
-            # loss_pull КАК В ТВОЁМ РАБОТАЮЩЕМ ФАЙЛЕ
             zs_n = [F.normalize(z, dim=-1, eps=1e-6) for z in zs]
-            z_center_n = F.normalize(torch.stack(zs_n, dim=0).mean(dim=0), dim=-1, eps=1e-6).detach()
+            z_center_n = F.normalize(
+                torch.stack(zs_n, dim=0).mean(dim=0), dim=-1, eps=1e-6
+            ).detach()
             loss_pull = sum(F.mse_loss(z, z_center_n) for z in zs_n) / len(zs_n)
 
             lam = lam_schedule(cfg, global_step)
@@ -159,7 +164,9 @@ def train(
                 last = None
                 for _ in range(steps):
                     opt_dir.zero_grad(set_to_none=True)
-                    dloss = sigreg.dir_objective(z_all)  # это -loss -> минимизируем -> максимизируем loss
+                    dloss = sigreg.dir_objective(
+                        z_all
+                    )  # это -loss -> минимизируем -> максимизируем loss
                     dloss.backward()
                     nn.utils.clip_grad_norm_(sigreg.parameters(), max_norm=5.0)
                     opt_dir.step()
@@ -170,8 +177,9 @@ def train(
 
                 qr_delta = float(sigreg.qr_project_())
 
-            # sigreg по view (как у тебя): разные seed -> разные рандомные направления
-            loss_sig = sum(sigreg(z, seed=global_step + i, detach_A=True) for i, z in enumerate(zs)) / len(zs)
+            loss_sig = sum(
+                sigreg(z, seed=global_step + i, detach_A=True) for i, z in enumerate(zs)
+            ) / len(zs)
 
             loss = (1.0 - lam) * loss_pull + lam * loss_sig
 
@@ -221,7 +229,9 @@ def train(
             global_step += 1
 
         if epoch % cfg.eval_every_epochs == 0:
-            z_test, y_test = extract_embeddings(encoder, test_plain_loader, device, max_samples=cfg.eval_max_samples)
+            z_test, y_test = extract_embeddings(
+                encoder, test_plain_loader, device, max_samples=cfg.eval_max_samples
+            )
 
             cm = eval_clustering(
                 z_test,
@@ -232,7 +242,9 @@ def train(
                 silhouette_samples=cfg.silhouette_samples,
             )
 
-            z_bank, y_bank = extract_embeddings(encoder, train_plain_loader, device, max_samples=cfg.knn_max_train)
+            z_bank, y_bank = extract_embeddings(
+                encoder, train_plain_loader, device, max_samples=cfg.knn_max_train
+            )
             qN = min(cfg.knn_max_test, y_test.size(0))
             z_query = z_test[:qN]
             y_query = y_test[:qN]
