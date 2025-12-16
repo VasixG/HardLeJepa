@@ -11,7 +11,7 @@ from config import TrainConfig
 from data.mnist import MNISTMultiViewCollate, make_mnist_ssl_and_plain_loaders
 from models.encoder import ResNetMNISTEncoder
 from losses.sigreg import SIGReg
-from losses.compress_ep import CompressionEP
+from losses.ep_compress import CompressionEP
 from utils.seed import set_seed
 from utils.logger import Logger
 from utils.plots import save_pca_scatter, save_tsne_scatter, save_confusion_matrix
@@ -33,37 +33,29 @@ def lam_schedule(cfg: TrainConfig, global_step: int) -> float:
     return float(cfg.sigreg_lambda) * min(1.0, t / max(1, ramp))
 
 
-def progress_after_resume(epoch: int, start_epoch: int, end_epoch: int) -> float:
-    denom = max(1, end_epoch - start_epoch)
-    p = (epoch - start_epoch) / denom
-    return float(max(0.0, min(1.0, p)))
+def drop_first_dims(z: torch.Tensor, k: int) -> torch.Tensor:
+    if k <= 0:
+        return z
+    k = min(k, z.size(1))
+    out = z.clone()
+    out[:, :k] = 0.0
+    return out
 
 
-def compress_scale_warm(
-    epoch: int, start_epoch: int, end_epoch: int, s0: float, s1: float, warm: int
-) -> float:
-    if epoch <= start_epoch + int(warm):
-        return float(s0)
-    denom = max(1, end_epoch - (start_epoch + int(warm)))
-    p = (epoch - (start_epoch + int(warm))) / denom
-    p = float(max(0.0, min(1.0, p)))
-    return float(s0 + (s1 - s0) * p)
+class DropDimsWrapper(nn.Module):
+    def __init__(self, encoder: nn.Module, drop_dims: int):
+        super().__init__()
+        self.encoder = encoder
+        self.drop_dims = int(drop_dims)
 
-
-def compress_lambda_warm(
-    epoch: int, start_epoch: int, end_epoch: int, lam_max: float, warm: int
-) -> float:
-    if epoch <= start_epoch + int(warm):
-        return 0.0
-    denom = max(1, end_epoch - (start_epoch + int(warm)))
-    p = (epoch - (start_epoch + int(warm))) / denom
-    p = float(max(0.0, min(1.0, p)))
-    return float(lam_max * p)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(x)
+        return drop_first_dims(z, self.drop_dims)
 
 
 @torch.no_grad()
-def dims_zero_metrics(z: torch.Tensor, dims: int, eps: float = 1e-3) -> Dict[str, float]:
-    D = z.size(1)
+def dims_zero_metrics(z_raw: torch.Tensor, dims: int, eps: float = 1e-3) -> Dict[str, float]:
+    D = z_raw.size(1)
     K = int(min(max(0, dims), D))
     if K <= 0:
         return {
@@ -73,15 +65,13 @@ def dims_zero_metrics(z: torch.Tensor, dims: int, eps: float = 1e-3) -> Dict[str
             "compress/frac_abs_lt_eps": 0.0,
             "compress/energy_frac": 0.0,
         }
-    u = z[:, :K]
+    u = z_raw[:, :K]
     abs_mean = float(u.abs().mean().item())
     std_mean = float(u.std(dim=0, unbiased=False).mean().item())
     frac = float((u.abs() < float(eps)).float().mean().item())
-
-    e_all = float((z * z).mean().item())
+    e_all = float((z_raw * z_raw).mean().item())
     e_sel = float((u * u).mean().item())
     energy_frac = float(e_sel / max(1e-12, e_all))
-
     return {
         "compress/dims": float(K),
         "compress/abs_mean": abs_mean,
@@ -91,16 +81,20 @@ def dims_zero_metrics(z: torch.Tensor, dims: int, eps: float = 1e-3) -> Dict[str
     }
 
 
-def eval_with_optional_drop(
+@torch.no_grad()
+def eval_on_dropped_embeddings(
     encoder: nn.Module,
     train_plain_loader,
     test_plain_loader,
     device: str,
     cfg: TrainConfig,
-    drop_dims: int = 0,
-) -> Tuple[Dict[str, float], Dict[str, float], Optional[torch.Tensor]]:
+    drop_dims: int,
+) -> Tuple[Dict[str, float], Optional[torch.Tensor]]:
+    enc_drop = DropDimsWrapper(encoder, drop_dims=drop_dims).to(device)
+    enc_drop.eval()
+
     z_test, y_test = extract_embeddings(
-        encoder, test_plain_loader, device, max_samples=cfg.eval_max_samples
+        enc_drop, test_plain_loader, device, max_samples=cfg.eval_max_samples
     )
     cm = eval_clustering(
         z_test,
@@ -112,7 +106,7 @@ def eval_with_optional_drop(
     )
 
     z_bank, y_bank = extract_embeddings(
-        encoder, train_plain_loader, device, max_samples=cfg.knn_max_train
+        enc_drop, train_plain_loader, device, max_samples=cfg.knn_max_train
     )
     qN = min(cfg.knn_max_test, y_test.size(0))
     z_query = z_test[:qN]
@@ -128,45 +122,13 @@ def eval_with_optional_drop(
         chunk_size=cfg.knn_chunk_size,
     )
 
-    out = {}
+    out: Dict[str, float] = {}
     for k, v in cm.items():
         out[f"eval/{k}"] = v
     for k, v in knn.items():
         out[f"eval/{k}"] = v
 
-    out_drop = {}
-    if int(drop_dims) > 0:
-        z_test_d = z_test.clone()
-        z_bank_d = z_bank.clone()
-        z_test_d[:, : int(drop_dims)] = 0.0
-        z_bank_d[:, : int(drop_dims)] = 0.0
-
-        cm_d = eval_clustering(
-            z_test_d,
-            y_test,
-            device=device,
-            kmeans_iters=cfg.kmeans_iters,
-            kmeans_restarts=cfg.kmeans_restarts,
-            silhouette_samples=cfg.silhouette_samples,
-        )
-        z_query_d = z_test_d[:qN]
-        knn_d, _ = eval_knn(
-            z_bank_d,
-            y_bank,
-            z_query_d,
-            y_query,
-            device=device,
-            k=cfg.knn_k,
-            temperature=cfg.knn_temperature,
-            chunk_size=cfg.knn_chunk_size,
-        )
-
-        for k, v in cm_d.items():
-            out_drop[f"eval_drop/{k}"] = v
-        for k, v in knn_d.items():
-            out_drop[f"eval_drop/{k}"] = v
-
-    return out, out_drop, knn_cm
+    return out, knn_cm
 
 
 def train(cfg: TrainConfig, args) -> None:
@@ -209,7 +171,6 @@ def train(cfg: TrainConfig, args) -> None:
 
     start_epoch = 0
     global_step = 0
-
     if args.init_from_ckpt is not None:
         ckpt = torch.load(args.init_from_ckpt, map_location=device)
         if "encoder" in ckpt:
@@ -219,13 +180,18 @@ def train(cfg: TrainConfig, args) -> None:
 
     logger = Logger(cfg.logdir, str(Path(cfg.logdir) / "metrics.csv"), use_tb=True)
 
+    drop_dims = int(args.drop_dims) if args.drop_dims is not None else int(args.compress_dims)
+    c_lam = float(args.compress_lambda)
+    c_scale = float(args.compress_scale)
+
     end_epoch = int(args.epochs)
     for epoch in range(start_epoch + 1, end_epoch + 1):
         encoder.train()
         pbar = tqdm(train_ssl_loader, desc=f"epoch {epoch}/{end_epoch}")
         for views, _y in pbar:
             views_list = [v.to(device, non_blocking=True) for v in views.views]
-            zs = [encoder(v) for v in views_list]
+            zs_raw = [encoder(v) for v in views_list]
+            zs = [drop_first_dims(z, drop_dims) for z in zs_raw]
 
             zs_n = [F.normalize(z, dim=-1) for z in zs]
             z_center_n = F.normalize(torch.stack(zs_n, dim=0).mean(dim=0), dim=-1).detach()
@@ -235,25 +201,9 @@ def train(cfg: TrainConfig, args) -> None:
 
             lam_sig = lam_schedule(cfg, global_step)
 
-            c_scale = compress_scale_warm(
-                epoch=epoch,
-                start_epoch=start_epoch,
-                end_epoch=end_epoch,
-                s0=float(args.compress_scale_start),
-                s1=float(args.compress_scale_end),
-                warm=int(args.compress_warm_epochs),
-            )
-            c_lam = compress_lambda_warm(
-                epoch=epoch,
-                start_epoch=start_epoch,
-                end_epoch=end_epoch,
-                lam_max=float(args.compress_lambda),
-                warm=int(args.compress_warm_epochs),
-            )
-
             loss_comp = sum(
-                compress(z, dims=int(args.compress_dims), scale=c_scale) for z in zs
-            ) / len(zs)
+                compress(z_raw, dims=int(args.compress_dims), scale=c_scale) for z_raw in zs_raw
+            ) / len(zs_raw)
 
             loss_main = (1.0 - lam_sig) * loss_pull + lam_sig * loss_sig
             loss = loss_main + c_lam * loss_comp
@@ -265,7 +215,9 @@ def train(cfg: TrainConfig, args) -> None:
 
             if global_step % cfg.log_every == 0:
                 with torch.no_grad():
+                    z0_raw = zs_raw[0]
                     z0 = zs[0]
+
                     pc_mean, pc_std = pairwise_cos_stats(z0)
                     au = alignment_uniformity(zs[0], zs[1] if len(zs) > 1 else None)
                     z_norm = z0.norm(dim=-1)
@@ -279,6 +231,7 @@ def train(cfg: TrainConfig, args) -> None:
                         "cfg/lambda_sigreg": float(lam_sig),
                         "cfg/compress_lambda": float(c_lam),
                         "cfg/compress_scale": float(c_scale),
+                        "cfg/drop_dims": float(drop_dims),
                         "repr/z_norm_mean": float(z_norm.mean().item()),
                         "repr/z_norm_std": float(z_norm.std(unbiased=False).item()),
                         "repr/pairwise_cos_mean": pc_mean,
@@ -290,7 +243,7 @@ def train(cfg: TrainConfig, args) -> None:
 
                     m.update(
                         dims_zero_metrics(
-                            z0, dims=int(args.compress_dims), eps=float(args.compress_eps)
+                            z0_raw, dims=int(args.compress_dims), eps=float(args.compress_eps)
                         )
                     )
 
@@ -305,36 +258,39 @@ def train(cfg: TrainConfig, args) -> None:
             global_step += 1
 
         if epoch % cfg.eval_every_epochs == 0:
-            eval_m, eval_drop_m, knn_cm = eval_with_optional_drop(
+            eval_m, knn_cm = eval_on_dropped_embeddings(
                 encoder=encoder,
                 train_plain_loader=train_plain_loader,
                 test_plain_loader=test_plain_loader,
                 device=device,
                 cfg=cfg,
-                drop_dims=int(args.drop_dims),
+                drop_dims=drop_dims,
             )
 
             metrics = {"epoch": float(epoch)}
             metrics.update(eval_m)
-            metrics.update(eval_drop_m)
             logger.log(global_step, metrics)
 
             if epoch % cfg.report_every_epochs == 0:
+                enc_drop = DropDimsWrapper(encoder, drop_dims=drop_dims).to(device)
+                enc_drop.eval()
+
                 z_test, y_test = extract_embeddings(
-                    encoder, test_plain_loader, device, max_samples=cfg.eval_max_samples
+                    enc_drop, test_plain_loader, device, max_samples=cfg.eval_max_samples
                 )
+
                 save_pca_scatter(
                     z_test,
                     y_test,
                     path=str(report_dir / f"epoch{epoch:03d}_pca.png"),
-                    title=f"compress_{args.compress_target} | epoch {epoch} | PCA (test)",
+                    title=f"compress_{args.compress_target} | drop{drop_dims} | epoch {epoch} | PCA (test)",
                     max_points=cfg.report_max_points,
                 )
                 save_tsne_scatter(
                     z_test,
                     y_test,
                     path=str(report_dir / f"epoch{epoch:03d}_tsne.png"),
-                    title=f"compress_{args.compress_target} | epoch {epoch} | t-SNE (test)",
+                    title=f"compress_{args.compress_target} | drop{drop_dims} | epoch {epoch} | t-SNE (test)",
                     max_points=min(cfg.report_max_points, 2000),
                     perplexity=cfg.tsne_perplexity,
                     iters=cfg.tsne_iters,
@@ -345,18 +301,18 @@ def train(cfg: TrainConfig, args) -> None:
                     save_confusion_matrix(
                         knn_cm,
                         path=str(report_dir / f"epoch{epoch:03d}_knn_cm.png"),
-                        title=f"compress_{args.compress_target} | epoch {epoch} | kNN confusion",
+                        title=f"compress_{args.compress_target} | drop{drop_dims} | epoch {epoch} | kNN confusion",
                         normalize=True,
                     )
 
                 if epoch % cfg.retrieval_every_epochs == 0:
                     save_retrieval_collage(
-                        encoder,
+                        enc_drop,
                         train_plain_loader,
                         test_plain_loader,
                         device=device,
                         path=str(report_dir / f"epoch{epoch:03d}_retrieval.png"),
-                        title=f"compress_{args.compress_target} | epoch {epoch} | retrieval (test->train)",
+                        title=f"compress_{args.compress_target} | drop{drop_dims} | epoch {epoch} | retrieval (test->train)",
                         bank_max=cfg.retrieval_bank_max,
                         query_num=cfg.retrieval_query_num,
                         topk=cfg.retrieval_topk,
@@ -371,6 +327,9 @@ def train(cfg: TrainConfig, args) -> None:
                 "opt": opt.state_dict(),
                 "compress_target": str(args.compress_target),
                 "compress_dims": int(args.compress_dims),
+                "compress_lambda": float(args.compress_lambda),
+                "compress_scale": float(args.compress_scale),
+                "drop_dims": int(drop_dims),
             },
             cfg.ckpt_path,
         )
@@ -391,22 +350,21 @@ def parse_args():
     p.add_argument("--lambda_sigreg", type=float, default=0.005)
     p.add_argument("--num_views", type=int, default=6)
 
-    p.add_argument("--compress_target", type=str, default="gauss", choices=["gauss", "laplace"])
+    p.add_argument("--compress_target", type=str, default="laplace", choices=["gauss", "laplace"])
     p.add_argument("--compress_dims", type=int, default=64)
-    p.add_argument("--compress_lambda", type=float, default=0.10)
-    p.add_argument("--compress_scale_start", type=float, default=1.0)
-    p.add_argument("--compress_scale_end", type=float, default=0.05)
-    p.add_argument("--compress_warm_epochs", type=int, default=3)
+    p.add_argument("--compress_lambda", type=float, default=0.02)
+    p.add_argument("--compress_scale", type=float, default=0.05)
     p.add_argument("--compress_eps", type=float, default=1e-3)
 
-    p.add_argument("--drop_dims", type=int, default=64)
+    p.add_argument("--drop_dims", type=int, default=None)
 
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    tag = f"compress_{args.compress_target}_K{args.compress_dims}_lam{args.compress_lambda}_s{args.compress_scale_start}to{args.compress_scale_end}"
+    drop_dims = args.drop_dims if args.drop_dims is not None else args.compress_dims
+    tag = f"compress_{args.compress_target}_K{args.compress_dims}_drop{drop_dims}_lam{args.compress_lambda}_s{args.compress_scale}"
     cfg = TrainConfig(
         method=f"pure_sigreg_{tag}",
         seed=args.seed,
