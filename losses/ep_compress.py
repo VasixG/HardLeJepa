@@ -10,48 +10,52 @@ def _trapz_weights(t: torch.Tensor) -> torch.Tensor:
     return w
 
 
-class EPCompression(nn.Module):
-    def __init__(self, t_min: float = -5.0, t_max: float = 5.0, t_steps: int = 17):
+class CompressionEP(nn.Module):
+    def __init__(
+        self,
+        emb_dim: int,
+        t_min: float = -5.0,
+        t_max: float = 5.0,
+        t_steps: int = 17,
+        target: str = "gauss",
+    ):
         super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.target = str(target)
+
         t = torch.linspace(float(t_min), float(t_max), int(t_steps), dtype=torch.float32)
         self.register_buffer("t", t, persistent=False)
-        self.register_buffer("w_base", _trapz_weights(t), persistent=False)
+        self.register_buffer("w_trapz", _trapz_weights(t), persistent=False)
 
-    def _phi_gaussian(self, sigma: torch.Tensor) -> torch.Tensor:
+    def _phi(self, scale: float) -> torch.Tensor:
         t = self.t
-        return torch.exp(-0.5 * (sigma * t) ** 2)
+        s = float(scale)
+        if self.target == "gauss":
+            return torch.exp(-0.5 * (s * s) * (t * t))
+        if self.target == "laplace":
+            return 1.0 / (1.0 + (s * s) * (t * t))
+        raise ValueError(f"Unknown target={self.target}")
 
-    def _phi_laplace(self, b: torch.Tensor) -> torch.Tensor:
-        t = self.t
-        return 1.0 / (1.0 + (b * t) ** 2)
+    def forward(self, z: torch.Tensor, dims: int, scale: float) -> torch.Tensor:
+        B, D = z.shape
+        if D != self.emb_dim:
+            raise ValueError("bad embedding dim")
+        K = int(min(max(0, dims), D))
+        if K <= 0:
+            return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-    def forward(self, u: torch.Tensor, target: str, scale: float) -> torch.Tensor:
-        if u.ndim != 2:
-            raise ValueError(f"u must be [B,K], got {tuple(u.shape)}")
-        B, K = u.shape
-        if K == 0:
-            return u.new_tensor(0.0)
-
-        u = u.float()
+        u = z[:, :K]
         u = u - u.mean(dim=0, keepdim=True)
 
-        s = u.new_tensor(float(scale))
-        if target == "gaussian":
-            phi = self._phi_gaussian(s)
-        elif target == "laplace":
-            phi = self._phi_laplace(s)
-        else:
-            raise ValueError(f"unknown target={target}")
+        t = self.t
+        phi = self._phi(scale).view(1, 1, -1)
 
-        w = self.w_base * phi
-        t = self.t.view(1, 1, -1)
+        u_exp = u.unsqueeze(-1) * t.view(1, 1, -1)
+        cos_m = torch.cos(u_exp).mean(dim=0, keepdim=True)
+        sin_m = torch.sin(u_exp).mean(dim=0, keepdim=True)
 
-        u_exp = u.unsqueeze(-1) * t
-        cos_m = torch.cos(u_exp).mean(dim=0)
-        sin_m = torch.sin(u_exp).mean(dim=0)
+        diff2 = (cos_m - phi).square() + sin_m.square()
 
-        phiKT = phi.view(1, -1)
-        diff2 = (cos_m - phiKT).pow(2) + sin_m.pow(2)
-
-        loss_per_dir = (diff2 * w.view(1, -1)).sum(dim=-1)
-        return loss_per_dir.mean() * float(B)
+        w = self.w_trapz.view(1, 1, -1)
+        loss_per_dim = (diff2 * w).sum(dim=-1).squeeze(0)
+        return loss_per_dim.mean() * B
